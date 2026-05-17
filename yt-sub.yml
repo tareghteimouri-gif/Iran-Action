@@ -1,0 +1,75 @@
+name: دانلودر زیرنویس یوتیوب
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: 'YouTube URL'
+        required: true
+        type: string
+      
+      subtitle_langs:
+        description: 'زبان‌های زیرنویس (مثال: en,fa)'
+        required: false
+        type: string
+        default: 'en,fa'
+
+permissions:
+  contents: write
+
+jobs:
+  fetch-subtitles:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install yt-dlp
+        run: |
+          pip install -q -U yt-dlp
+
+      - name: Download SRT subtitles with timestamps
+        run: |
+          URL="${{ github.event.inputs.video_url }}"
+          SUB_LANGS="${{ github.event.inputs.subtitle_langs }}"
+          OUTPUT_FOLDER="subtitles"
+
+          mkdir -p "$OUTPUT_FOLDER"
+
+          yt-dlp \
+            --skip-download \
+            --write-subs \
+            --write-auto-subs \
+            --sub-langs "$SUB_LANGS" \
+            --convert-subs srt \
+            --sub-format srt \
+            --output "$OUTPUT_FOLDER/%(title)s - %(language)s.%(ext)s" \
+            "$URL"
+
+      - name: Verify SRT files
+        run: |
+          echo "✅ زیرنویس‌های دانلود شده با فرمت SRT:"
+          ls -la subtitles/
+          
+          for file in subtitles/*.srt; do
+            if [ -f "$file" ]; then
+              echo "━━━━━━━━━━━━━━━━━━━━"
+              echo "📄 فایل: $(basename "$file")"
+              echo "خطوط اول فایل:"
+              head -10 "$file"
+              echo "━━━━━━━━━━━━━━━━━━━━"
+            fi
+          done
+
+      - name: Push SRT files to repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add subtitles/
+          git commit -m "Download SRT subtitles with timestamps [skip ci]" || echo "Nothing to commit"
+          git push
