@@ -1,228 +1,194 @@
-name: ytld-sub Release
+name: استخراج زیرنویس فارسی و انگلیسی
+
 on:
-  push:
-    # publish only when pushed to master
-    branches:
-      - master
-  pull_request:
-env:
-  ACTIONS_STEP_DEBUG: true
-  ACTIONS_RUNNER_DEBUG: true
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: '🔗 لینک ویدیو (YouTube, Vimeo, و غیره)'
+        required: true
+        type: string
+        default: 'https://www.youtube.com/watch?v=example'
+
+      subtitle_method:
+        description: '🎤 روش استخراج زیرنویس'
+        required: true
+        type: choice
+        options:
+          - auto (اول زیرنویس توکار، در غیر این صورت Whisper)
+          - whisper_only (اجباری تبدیل گفتار به متن)
+        default: 'auto (اول زیرنویس توکار، در غیر این صورت Whisper)'
+
+      whisper_model:
+        description: '🧠 مدل Whisper (برای دقت بیشتر مدل bigger انتخاب کنید)'
+        required: false
+        type: choice
+        options:
+          - tiny
+          - base
+          - small
+          - medium
+          - large
+        default: 'base'
+
+permissions:
+  contents: write
+
 jobs:
-  version:
-    name: version
+  extract-subtitles:
     runs-on: ubuntu-latest
-    outputs:
-      pypi_version: ${{ steps.set_outputs.outputs.pypi_version }}
-      local_version: ${{ steps.set_outputs.outputs.local_version }}
-      init_contents: ${{ steps.set_outputs.outputs.init_contents }}
+    timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v3
+      - name: 📂 دریافت ریپازیتوری
+        uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-          ref: master
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set date and commit hash variables
+      - name: 🐍 راه‌اندازی Python و نصب ابزارها
         run: |
-          echo "DATE=$(date +'%Y.%m.%d')" >> $GITHUB_ENV
-          echo "COMMIT_HASH=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg  # برای Whisper و yt-dlp لازم است
+          pip install --upgrade pip
+          pip install yt-dlp whisper openai-whisper googletrans==4.0.0-rc1 pysubs2 torch torchaudio
 
-      - name: Count number of commits on master on day, minus 1 to account for post-push
+      - name: 🧠 اجرای اسکریپت استخراج و ترجمه زیرنویس
+        id: extract
         run: |
-          echo "DATE_COMMIT_COUNT=$(($(git rev-list --count master --since='${{ env.DATE }} 00:00:00')-1))" >> $GITHUB_ENV
-      - name: Set pypi and local version values
+          python3 << 'EOF'
+          import os, sys, re
+          from yt_dlp import YoutubeDL
+          import whisper
+          import pysubs2
+          from googletrans import Translator
+          import torch
+
+          # ----- دریافت ورودی‌ها -----
+          video_url = os.environ.get('INPUT_URL')
+          method = os.environ.get('INPUT_METHOD')
+          model_size = os.environ.get('INPUT_MODEL', 'base')
+
+          print(f"🎬 شروع پردازش: {video_url}")
+          print(f"🔧 روش: {method} | مدل Whisper: {model_size}")
+
+          # ----- تابع استخراج زیرنویس توکار با yt-dlp -----
+          def get_embedded_subtitles(url):
+              ydl_opts = {
+                  'skip_download': True,
+                  'writesubtitles': True,
+                  'subtitleslangs': ['en'],
+                  'subtitlesformat': 'srt',
+                  'outtmpl': 'downloads/subtitle_en',
+              }
+              with YoutubeDL(ydl_opts) as ydl:
+                  try:
+                      ydl.download([url])
+                  except Exception as e:
+                      print(f"⚠️ خطا در yt-dlp: {e}")
+                      return False
+              # بررسی فایل ایجاد شده
+              if os.path.exists('downloads/subtitle_en.en.srt'):
+                  os.rename('downloads/subtitle_en.en.srt', 'downloads/subtitle_en.srt')
+                  return True
+              return False
+
+          # ----- تابع استخراج با Whisper (تبدیل صوت به متن) -----
+          def generate_with_whisper(url, model_name):
+              # دانلود فقط صوت
+              audio_opts = {
+                  'format': 'bestaudio/best',
+                  'outtmpl': 'downloads/audio.%(ext)s',
+                  'postprocessors': [{
+                      'key': 'FFmpegExtractAudio',
+                      'preferredcodec': 'mp3',
+                      'preferredquality': '128',
+                  }],
+              }
+              with YoutubeDL(audio_opts) as ydl:
+                  ydl.download([url])
+              audio_path = 'downloads/audio.mp3'
+
+              device = "cuda" if torch.cuda.is_available() else "cpu"
+              model = whisper.load_model(model_name, device=device)
+              result = model.transcribe(audio_path, language="en")
+              # ساخت فایل SRT
+              subs = pysubs2.SSAFile()
+              for seg in result["segments"]:
+                  start = seg["start"]
+                  end = seg["end"]
+                  text = seg["text"].strip()
+                  subs.append(pysubs2.SSAEvent(start=start, end=end, text=text))
+              subs.save("downloads/subtitle_en.srt")
+              print("✅ زیرنویس انگلیسی با Whisper ساخته شد.")
+              return True
+
+          # ----- تابع ترجمه به فارسی -----
+          def translate_to_persian():
+              if not os.path.exists('downloads/subtitle_en.srt'):
+                  print("❌ فایل انگلیسی یافت نشد، ترجمه امکان‌پذیر نیست.")
+                  return False
+              subs_en = pysubs2.load('downloads/subtitle_en.srt')
+              subs_fa = pysubs2.SSAFile()
+              translator = Translator()
+              total = len(subs_en)
+              for idx, event in enumerate(subs_en):
+                  try:
+                      # ترجمه هر خط جداگانه
+                      translated = translator.translate(event.text, src='en', dest='fa')
+                      event.text = translated.text
+                  except Exception as e:
+                      print(f"⚠️ خطا در ترجمه خط {idx+1}: {e}")
+                      event.text = "[خطا در ترجمه]"
+                  subs_fa.append(event)
+                  if (idx+1) % 10 == 0:
+                      print(f"🔄 ترجمه شده: {idx+1} از {total}")
+              subs_fa.save('downloads/subtitle_fa.srt')
+              print("✅ زیرنویس فارسی ذخیره شد.")
+              return True
+
+          # ----- ایجاد پوشه downloads -----
+          os.makedirs('downloads', exist_ok=True)
+
+          # ----- منطق اصلی -----
+          success = False
+          if method == 'auto (اول زیرنویس توکار، در غیر این صورت Whisper)':
+              if get_embedded_subtitles(video_url):
+                  print("✅ زیرنویس توکار انگلیسی استخراج شد.")
+                  success = True
+              else:
+                  print("⚠️ زیرنویس توکار یافت نشد → استفاده از Whisper")
+                  success = generate_with_whisper(video_url, model_size)
+          else:  # whisper_only
+              success = generate_with_whisper(video_url, model_size)
+
+          if not success:
+              print("::error:: استخراج زیرنویس با شکست مواجه شد.")
+              sys.exit(1)
+
+          # ترجمه به فارسی
+          translate_to_persian()
+
+          # خروجی برای مراحل بعد (اختیاری)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write("status=success\n")
+          print("🎉 کار با موفقیت تمام شد. فایل‌ها در پوشه downloads قرار دارند.")
+          EOF
+        env:
+          INPUT_URL: ${{ github.event.inputs.video_url }}
+          INPUT_METHOD: ${{ github.event.inputs.subtitle_method }}
+          INPUT_MODEL: ${{ github.event.inputs.whisper_model }}
+
+      - name: 📅 دریافت تاریخ
+        id: get_date
+        run: echo "date=$(date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
+
+      - name: 📤 ارسال به ریپازیتوری (پوشه downloads)
         run: |
-          echo "LOCAL_VERSION=${{ env.DATE }}+${{ env.COMMIT_HASH }}" >> $GITHUB_ENV
-          if [ ${{ env.DATE_COMMIT_COUNT }} -le "0" ]
-          then
-            echo "PYPI_VERSION=${{ env.DATE }}" >> $GITHUB_ENV
-          else
-            echo "PYPI_VERSION=${{ env.DATE }}.post${{ env.DATE_COMMIT_COUNT }}" >> $GITHUB_ENV
-          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add downloads/
+          git diff --staged --quiet || git commit -m "🎬 استخراج زیرنویس برای ویدیو: ${{ github.event.inputs.video_url }} [skip ci]"
+          git push origin main
 
-      - name: Test versions
-        run: |
-          echo "${{ env.PYPI_VERSION }}"
-          echo "${{ env.LOCAL_VERSION }}"
-
-      - id: set_outputs
-        run: |
-          echo "pypi_version=${{ env.PYPI_VERSION }}" >> "$GITHUB_OUTPUT"
-          echo "local_version=${{ env.LOCAL_VERSION }}" >> "$GITHUB_OUTPUT"
-          echo 'init_contents=__pypi_version__ = "${{ env.PYPI_VERSION }}";__local_version__ = "${{ env.LOCAL_VERSION }}"' >> "$GITHUB_OUTPUT"
-
-  ##################################################################################################
-
-  build-linux:
-    name: build-linux
-    needs:
-      - version
-    strategy:
-      matrix:
-        arch: [ "aarch64", "x86_64" ]
-        include:
-          - arch: "aarch64"
-            runner: "ubuntu-24.04-arm"
-            container: "quay.io/pypa/manylinux_2_28_aarch64"
-          - arch: "x86_64"
-            runner: "ubuntu-latest"
-            container: "quay.io/pypa/manylinux_2_28_x86_64"
-    runs-on: ${{ matrix.runner }}
-    container:
-      image: ${{ matrix.container }}
-    steps:
-      - uses: actions/checkout@v3
-      - name: Write version to init file
-        run: |
-          echo '${{ needs.version.outputs.init_contents }}' > src/ytdl_sub/__init__.py
-      - name: Install base packages
-        run: |
-          cat /etc/os-release
-          dnf update -y
-          dnf install -y epel-release tar wget make gcc openssl-devel bzip2-devel libffi-devel zlib-devel
-      - name: Install Python
-        run: |
-          wget https://www.python.org/ftp/python/3.12.9/Python-3.12.9.tar.xz
-          tar -xf Python-3.12.9.tar.xz
-          cd Python-3.12.9 && ./configure --with-ensurepip=install --prefix=/usr/local --enable-shared LDFLAGS="-Wl,-rpath /usr/local/lib"
-          make -j 8
-          make altinstall
-          python3.12 --version
-          python3.12 -m ensurepip --upgrade
-      - name: Build Package
-        run: |
-          python3.12 -m pip install -e .
-          python3.12 -m pip install pyinstaller
-          # Build executable
-          pyinstaller ytdl-sub.spec
-          mkdir -p /opt/builds
-          chmod ugo+rwx dist/ytdl-sub
-          dist/ytdl-sub -h
-          mv dist/ytdl-sub /opt/builds/ytdl-sub_${{ matrix.arch }}
-
-      - name: Upload build
-        uses: actions/upload-artifact@v4
-        with:
-          name: ytdl-sub_${{ matrix.arch }}
-          path: /opt/builds/ytdl-sub_${{ matrix.arch }}
-
-  ##################################################################################################
-
-  build-windows:
-    name: build-windows
-    needs:
-      - version
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v3
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.12"
-      - name: Write version to init file
-        run: |
-          echo '${{ needs.version.outputs.init_contents }}'> src/ytdl_sub/__init__.py
-      - name: Build Package
-        run: |
-          python -m pip install -e .
-          python -m pip install pyinstaller
-          pyinstaller ytdl-sub.spec
-          .\dist\ytdl-sub.exe -h
-
-      - name: Upload build
-        uses: actions/upload-artifact@v4
-        with:
-          name: ytdl-sub_exe
-          path: .\dist\ytdl-sub.exe
-
-  ##################################################################################################
-
-  github-release:
-    name: github-release
-    needs:
-      - version
-      - build-linux
-      - build-windows
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - name: Write version to init file
-        run: |
-          echo '${{ needs.version.outputs.init_contents }}' > src/ytdl_sub/__init__.py
-
-      - name: Restore exe build
-        uses: actions/download-artifact@v4
-        with:
-          name: ytdl-sub_exe
-          path: /opt/builds
-
-      - name: Restore aarch64 build
-        uses: actions/download-artifact@v4
-        with:
-          name: ytdl-sub_aarch64
-          path: /opt/builds
-
-      - name: Restore x86_64 build
-        uses: actions/download-artifact@v4
-        with:
-          name: ytdl-sub_x86_64
-          path: /opt/builds
-
-      - name: Rename x86_64 build
-        run: |
-          mv /opt/builds/ytdl-sub_x86_64 /opt/builds/ytdl-sub
-
-      - name: Inspect build directory, rename x86_64 build
-        run: |
-          ls -lh /opt/builds
-
-      - name: Create Release
-        if: ${{
-          github.ref == 'refs/heads/master'
-          && !contains(github.event.head_commit.message, '[DEV]')
-          && !contains(github.event.head_commit.message, '[DOCS]')
-          }}
-        id: create_release
-        uses: softprops/action-gh-release@v1
-        with:
-          name: ytdl-sub ${{ needs.version.outputs.pypi_version }}
-          tag_name: ${{ needs.version.outputs.pypi_version }}
-          body: ${{ github.event.head_commit.message }}
-          draft: false
-          prerelease: false
-          files: |
-            /opt/builds/ytdl-sub
-            /opt/builds/ytdl-sub_aarch64
-            /opt/builds/ytdl-sub.exe
-
-  pypi-publish:
-    name: pypi-publish
-    needs:
-      - version
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
-        with:
-          python-version: '3.12'
-      - name: Write version to init file
-        run: |
-          echo '${{ needs.version.outputs.init_contents }}' > src/ytdl_sub/__init__.py
-      - name: Build wheel
-        run: |
-          # Build wheel
-          pip install -e .
-          pip install build
-          python3 -m build
-
-      - name: Publish distribution 📦 to PyPI
-        if: ${{
-          github.ref == 'refs/heads/master'
-          && !contains(github.event.head_commit.message, '[DEV]')
-          && !contains(github.event.head_commit.message, '[DOCS]')
-          }}
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          password: ${{ secrets.PYPI_API_TOKEN }}
+      - name: 🧹 پاکسازی
+        if: always()
+        run: rm -rf downloads/audio.* downloads/*.mp3 2>/dev/null || true
