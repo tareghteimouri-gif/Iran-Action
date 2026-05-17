@@ -1,194 +1,66 @@
-name: استخراج زیرنویس فارسی و انگلیسی
+name: CI Build, Test, and Deploy
+
+env:
+  VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+  VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+  CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
 on:
-  workflow_dispatch:
-    inputs:
-      video_url:
-        description: '🔗 لینک ویدیو (YouTube, Vimeo, و غیره)'
-        required: true
-        type: string
-        default: 'https://www.youtube.com/watch?v=example'
-
-      subtitle_method:
-        description: '🎤 روش استخراج زیرنویس'
-        required: true
-        type: choice
-        options:
-          - auto (اول زیرنویس توکار، در غیر این صورت Whisper)
-          - whisper_only (اجباری تبدیل گفتار به متن)
-        default: 'auto (اول زیرنویس توکار، در غیر این صورت Whisper)'
-
-      whisper_model:
-        description: '🧠 مدل Whisper (برای دقت بیشتر مدل bigger انتخاب کنید)'
-        required: false
-        type: choice
-        options:
-          - tiny
-          - base
-          - small
-          - medium
-          - large
-        default: 'base'
-
-permissions:
-  contents: write
+  pull_request:
+  push:
 
 jobs:
-  extract-subtitles:
+  test:
+    name: Unit tests
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
+    timeout-minutes: 10
     steps:
-      - name: 📂 دریافت ریپازیتوری
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: 🐍 راه‌اندازی Python و نصب ابزارها
+          python-version: "3.x"
+      - name: Install dependencies
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg  # برای Whisper و yt-dlp لازم است
-          pip install --upgrade pip
-          pip install yt-dlp whisper openai-whisper googletrans==4.0.0-rc1 pysubs2 torch torchaudio
-
-      - name: 🧠 اجرای اسکریپت استخراج و ترجمه زیرنویس
-        id: extract
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Test with pytest
         run: |
-          python3 << 'EOF'
-          import os, sys, re
-          from yt_dlp import YoutubeDL
-          import whisper
-          import pysubs2
-          from googletrans import Translator
-          import torch
+          pip install pytest pytest-cov
+          pytest -v --cov=. --cov-report=xml
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v3
 
-          # ----- دریافت ورودی‌ها -----
-          video_url = os.environ.get('INPUT_URL')
-          method = os.environ.get('INPUT_METHOD')
-          model_size = os.environ.get('INPUT_MODEL', 'base')
+  stag-deploy:
+    name: Deployment to staging
+    runs-on: ubuntu-latest
+    environment: Staging
+    needs: test
+    if: github.ref == 'refs/heads/staging'
+    steps:
+      - uses: actions/checkout@v2
+      - name: Install Vercel CLI
+        run: npm install --global vercel@latest
+      - name: Pull Vercel Environment Information
+        run: vercel pull --yes --environment=preview --token=${{ secrets.VERCEL_ACCESS_TOKEN }}
+      - name: Build Project Artifacts
+        run: vercel build --token=${{ secrets.VERCEL_ACCESS_TOKEN }}
+      - name: Deploy Project Artifacts to Vercel
+        run: vercel deploy --prebuilt --token=${{ secrets.VERCEL_ACCESS_TOKEN }}
 
-          print(f"🎬 شروع پردازش: {video_url}")
-          print(f"🔧 روش: {method} | مدل Whisper: {model_size}")
-
-          # ----- تابع استخراج زیرنویس توکار با yt-dlp -----
-          def get_embedded_subtitles(url):
-              ydl_opts = {
-                  'skip_download': True,
-                  'writesubtitles': True,
-                  'subtitleslangs': ['en'],
-                  'subtitlesformat': 'srt',
-                  'outtmpl': 'downloads/subtitle_en',
-              }
-              with YoutubeDL(ydl_opts) as ydl:
-                  try:
-                      ydl.download([url])
-                  except Exception as e:
-                      print(f"⚠️ خطا در yt-dlp: {e}")
-                      return False
-              # بررسی فایل ایجاد شده
-              if os.path.exists('downloads/subtitle_en.en.srt'):
-                  os.rename('downloads/subtitle_en.en.srt', 'downloads/subtitle_en.srt')
-                  return True
-              return False
-
-          # ----- تابع استخراج با Whisper (تبدیل صوت به متن) -----
-          def generate_with_whisper(url, model_name):
-              # دانلود فقط صوت
-              audio_opts = {
-                  'format': 'bestaudio/best',
-                  'outtmpl': 'downloads/audio.%(ext)s',
-                  'postprocessors': [{
-                      'key': 'FFmpegExtractAudio',
-                      'preferredcodec': 'mp3',
-                      'preferredquality': '128',
-                  }],
-              }
-              with YoutubeDL(audio_opts) as ydl:
-                  ydl.download([url])
-              audio_path = 'downloads/audio.mp3'
-
-              device = "cuda" if torch.cuda.is_available() else "cpu"
-              model = whisper.load_model(model_name, device=device)
-              result = model.transcribe(audio_path, language="en")
-              # ساخت فایل SRT
-              subs = pysubs2.SSAFile()
-              for seg in result["segments"]:
-                  start = seg["start"]
-                  end = seg["end"]
-                  text = seg["text"].strip()
-                  subs.append(pysubs2.SSAEvent(start=start, end=end, text=text))
-              subs.save("downloads/subtitle_en.srt")
-              print("✅ زیرنویس انگلیسی با Whisper ساخته شد.")
-              return True
-
-          # ----- تابع ترجمه به فارسی -----
-          def translate_to_persian():
-              if not os.path.exists('downloads/subtitle_en.srt'):
-                  print("❌ فایل انگلیسی یافت نشد، ترجمه امکان‌پذیر نیست.")
-                  return False
-              subs_en = pysubs2.load('downloads/subtitle_en.srt')
-              subs_fa = pysubs2.SSAFile()
-              translator = Translator()
-              total = len(subs_en)
-              for idx, event in enumerate(subs_en):
-                  try:
-                      # ترجمه هر خط جداگانه
-                      translated = translator.translate(event.text, src='en', dest='fa')
-                      event.text = translated.text
-                  except Exception as e:
-                      print(f"⚠️ خطا در ترجمه خط {idx+1}: {e}")
-                      event.text = "[خطا در ترجمه]"
-                  subs_fa.append(event)
-                  if (idx+1) % 10 == 0:
-                      print(f"🔄 ترجمه شده: {idx+1} از {total}")
-              subs_fa.save('downloads/subtitle_fa.srt')
-              print("✅ زیرنویس فارسی ذخیره شد.")
-              return True
-
-          # ----- ایجاد پوشه downloads -----
-          os.makedirs('downloads', exist_ok=True)
-
-          # ----- منطق اصلی -----
-          success = False
-          if method == 'auto (اول زیرنویس توکار، در غیر این صورت Whisper)':
-              if get_embedded_subtitles(video_url):
-                  print("✅ زیرنویس توکار انگلیسی استخراج شد.")
-                  success = True
-              else:
-                  print("⚠️ زیرنویس توکار یافت نشد → استفاده از Whisper")
-                  success = generate_with_whisper(video_url, model_size)
-          else:  # whisper_only
-              success = generate_with_whisper(video_url, model_size)
-
-          if not success:
-              print("::error:: استخراج زیرنویس با شکست مواجه شد.")
-              sys.exit(1)
-
-          # ترجمه به فارسی
-          translate_to_persian()
-
-          # خروجی برای مراحل بعد (اختیاری)
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write("status=success\n")
-          print("🎉 کار با موفقیت تمام شد. فایل‌ها در پوشه downloads قرار دارند.")
-          EOF
-        env:
-          INPUT_URL: ${{ github.event.inputs.video_url }}
-          INPUT_METHOD: ${{ github.event.inputs.subtitle_method }}
-          INPUT_MODEL: ${{ github.event.inputs.whisper_model }}
-
-      - name: 📅 دریافت تاریخ
-        id: get_date
-        run: echo "date=$(date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
-
-      - name: 📤 ارسال به ریپازیتوری (پوشه downloads)
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add downloads/
-          git diff --staged --quiet || git commit -m "🎬 استخراج زیرنویس برای ویدیو: ${{ github.event.inputs.video_url }} [skip ci]"
-          git push origin main
-
-      - name: 🧹 پاکسازی
-        if: always()
-        run: rm -rf downloads/audio.* downloads/*.mp3 2>/dev/null || true
+  prod-deploy:
+    name: Deployment to production
+    runs-on: ubuntu-latest
+    environment: Production
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v2
+      - name: Install Vercel CLI
+        run: npm install --global vercel@latest
+      - name: Pull Vercel Environment Information
+        run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_ACCESS_TOKEN }}
+      - name: Build Project Artifacts
+        run: vercel build --prod --token=${{ secrets.VERCEL_ACCESS_TOKEN }}
+      - name: Deploy Project Artifacts to Vercel
+        run: vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_ACCESS_TOKEN }}
