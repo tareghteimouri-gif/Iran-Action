@@ -1,0 +1,106 @@
+name: Poo poo - Clean Downloads Folder
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "DELETE" to confirm wiping downloads folder'
+        required: true
+        type: string
+      delete_git_history:
+        description: 'Also delete from git history (permanently remove files)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  clean-downloads:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Verify confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "DELETE" ]; then
+            echo "❌ Confirmation failed. Type 'DELETE' to confirm."
+            exit 1
+          fi
+          echo "✅ Confirmation received"
+
+      - name: Delete downloads folder contents
+        run: |
+          echo "🧹 Clearing downloads folder..."
+          
+          # Count files before deletion
+          if [ -d "downloads" ]; then
+            FILE_COUNT=$(find downloads -type f 2>/dev/null | wc -l)
+            echo "📊 Found $FILE_COUNT files to delete"
+            
+            # Delete all contents but keep the folder
+            rm -rf downloads/*
+            rm -rf downloads/.[!.]* 2>/dev/null || true
+            
+            echo "✅ Deleted $FILE_COUNT files from downloads/"
+            
+            # Create a .gitkeep to preserve empty folder
+            touch downloads/.gitkeep
+          else
+            echo "📁 downloads folder doesn't exist, creating it"
+            mkdir -p downloads
+            touch downloads/.gitkeep
+          fi
+
+      - name: Remove from git history (optional)
+        if: github.event.inputs.delete_git_history == 'true'
+        run: |
+          echo "⚠️ PERMANENT: Removing downloads from git history..."
+          
+          # Use git filter-repo or BFG to remove downloads folder from history
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+          
+          # Install git-filter-repo
+          sudo apt-get update
+          sudo apt-get install -y git-filter-repo
+          
+          # Remove downloads folder from entire history
+          git filter-repo --path downloads --invert-paths --force
+          
+          # Force push the cleaned history
+          git remote add origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+          git push origin --force --all
+          
+          echo "✅ Downloads removed from git history"
+          echo "⚠️ Other contributors need to re-clone the repository"
+
+      - name: Commit and push changes
+        if: github.event.inputs.delete_git_history == 'false'
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          
+          git add downloads/
+          git commit -m "[Poo poo] Clean downloads folder [skip ci]" || echo "No changes to commit"
+          git pull --rebase origin ${{ github.ref_name }} || true
+          git push origin HEAD:${{ github.ref_name }}
+          
+          echo "🎉 Downloads folder cleaned successfully!"
+
+      - name: Summary
+        run: |
+          echo "## 🧹 Cleanup Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Action**: Deleted all files from \`downloads/\` folder" >> $GITHUB_STEP_SUMMARY
+          echo "- **Git History**: ${{ github.event.inputs.delete_git_history }}" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event.inputs.delete_git_history }}" = "true" ]; then
+            echo "- ⚠️ **Warning**: History rewritten, force push completed" >> $GITHUB_STEP_SUMMARY
+          fi
