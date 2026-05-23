@@ -1,0 +1,161 @@
+name: Download with yt-dlp & Save to Repo
+
+on:
+  push:
+    branches:
+      - "**"
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup yt-dlp
+        uses: AnimMouse/setup-yt-dlp@v3
+          
+      - name: Setup YouTube Cookies
+        run: |
+          mkdir -p ~/.cache/yt-dlp/youtube
+          echo "${{ secrets.YOUTUBE_COOKIES }}" > ~/.cache/yt-dlp/youtube/cookies.txt
+          echo "✅ Cookies installed ($(wc -l < ~/.cache/yt-dlp/youtube/cookies.txt) lines)"
+
+      - name: Parse commit message and download
+        run: |
+          MSG=$(git log -1 --pretty=%B)
+          echo "Commit message:"
+          echo "$MSG"
+          echo "----------------------------------------"
+
+          URL=$(echo "$MSG" | grep -oP '(https?://\S+)' | head -n1)
+          if [ -z "$URL" ]; then
+            echo "❌ No URL found in commit message"
+            exit 1
+          fi
+
+          echo "📥 URL: $URL"
+
+          # Default options (same as before)
+          QUALITY="best"
+          PLAYLIST="--no-playlist"
+          AUDIO_ONLY="false"
+          SUBTITLES="false"
+          SPONSORBLOCK="true"
+
+          if echo "$MSG" | grep -qi "quality: *1080"; then QUALITY="1080"; fi
+          if echo "$MSG" | grep -qi "quality: *720";  then QUALITY="720"; fi
+          if echo "$MSG" | grep -qi "quality: *480";  then QUALITY="480"; fi
+
+          if echo "$MSG" | grep -qi "playlist: *true";      then PLAYLIST="--yes-playlist"; fi
+          if echo "$MSG" | grep -qi "audio-only: *true";    then AUDIO_ONLY="true"; fi
+          if echo "$MSG" | grep -qi "subtitles: *true";     then SUBTITLES="true"; fi
+          if echo "$MSG" | grep -qi "sponsorblock: *false"; then SPONSORBLOCK="false"; fi
+
+          mkdir -p downloads
+
+          echo "⚙️ Options: Quality=$QUALITY | Playlist=${PLAYLIST/--no-playlist/Disabled} | Audio=$AUDIO_ONLY"
+
+          YT_CMD="yt-dlp \
+            --concurrent-fragments 8 \
+            --retries 10 \
+            --fragment-retries 10 \
+            --cookies ~/.cache/yt-dlp/youtube/cookies.txt"
+
+          if [ "$AUDIO_ONLY" = "true" ]; then
+            YT_CMD="$YT_CMD -x --audio-format mp3 --audio-quality 0"
+          else
+            case $QUALITY in
+              1080) YT_CMD="$YT_CMD -f 'bestvideo[height<=1080]+bestaudio/best[height<=1080]'" ;;
+              720)  YT_CMD="$YT_CMD -f 'bestvideo[height<=720]+bestaudio/best[height<=720]'" ;;
+              480)  YT_CMD="$YT_CMD -f 'bestvideo[height<=480]+bestaudio/best[height<=480]'" ;;
+              *)    YT_CMD="$YT_CMD -f 'bestvideo+bestaudio/best'" ;;
+            esac
+            YT_CMD="$YT_CMD --merge-output-format mp4"
+          fi
+
+          if [ "$PLAYLIST" = "--yes-playlist" ]; then
+            YT_CMD="$YT_CMD --yes-playlist"
+          else
+            YT_CMD="$YT_CMD --no-playlist"
+          fi
+
+         
+          [ "$SUBTITLES" = "true" ] && YT_CMD="$YT_CMD --write-auto-sub --embed-subs"
+          [ "$SPONSORBLOCK" = "true" ] && YT_CMD="$YT_CMD --sponsorblock-remove all"
+
+          YT_CMD="$YT_CMD --embed-metadata --embed-thumbnail --embed-chapters --restrict-filenames"
+          YT_CMD="$YT_CMD --output 'downloads/%(title)s [%(id)s].%(ext)s'"
+
+          echo "🚀 Running yt-dlp..."
+          eval "$YT_CMD \"$URL\""
+
+          echo "✅ Download finished"
+          
+      - name: Split large files into 90MB chunks
+        run: |
+          echo "🔧 Processing downloaded files for splitting..."
+      
+          LIMIT=$((90 * 1024 * 1024))  # 90MB
+      
+          for FILE in downloads/*; do
+            [ -f "$FILE" ] || continue
+      
+            SIZE=$(stat -c%s "$FILE")
+            BASENAME=$(basename "$FILE")
+      
+            # Remove extension
+            NAME="${BASENAME%.*}"
+      
+            # Convert to clean kebab-case
+            FOLDERNAME=$(echo "$NAME" \
+              | tr '[:upper:]' '[:lower:]' \
+              | sed 's/[^a-z0-9]/-/g' \
+              | sed 's/-\+/-/g' \
+              | sed 's/^-//;s/-$//')
+      
+            echo "📄 $BASENAME ($(numfmt --to=iec-i --suffix=B $SIZE))"
+      
+            if [ "$SIZE" -gt "$LIMIT" ]; then
+              echo "✂️ Splitting large file → Folder: $FOLDERNAME"
+      
+              # Create destination folder
+              mkdir -p "downloads/$FOLDERNAME"
+      
+              # Move original file into folder
+              mv "$FILE" "downloads/$FOLDERNAME/$BASENAME"
+      
+              # Enter folder
+              cd "downloads/$FOLDERNAME" || exit 1
+      
+              # Create multipart zip INSIDE the folder
+              zip -s 90m "${FOLDERNAME}.zip" "$BASENAME" -q
+      
+              # Remove original file after successful zip
+              rm -f "$BASENAME"
+      
+              cd ../..
+      
+              echo "✅ Multipart zip created in downloads/$FOLDERNAME/"
+            else
+              echo "✅ File under 90MB → kept as single file"
+            fi
+          done
+      
+          echo "🎉 All files processed successfully"
+
+
+      - name: Commit & Push
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add downloads/
+          git commit -m "Add downloaded files from commit [skip ci]" || echo "Nothing to commit"
+          echo "🚀 Pushing to branch: $BRANCH"
+          git push origin HEAD:$BRANCH
